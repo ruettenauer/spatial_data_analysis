@@ -1,0 +1,22 @@
+---
+title: "Handbook_Spatial"
+
+output:
+  word_document:   
+
+---
+
+# Spatial Data Analysis  {.unnumbered}
+
+Tobias Rüttenauer 
+
+ORCID: 0000-0001-5747-9735
+
+### Abstract {.unnumbered}
+
+This handbook chapter provides an essential introduction to the field of spatial econometrics, offering a comprehensive overview of techniques and methodologies for analysing spatial data in the social sciences. Spatial econometrics addresses the unique challenges posed by spatially dependent observations, where spatial relationships among data points can significantly impact statistical analyses. The chapter begins by exploring the fundamental concepts of spatial dependence and spatial autocorrelation, and highlighting their implications for traditional econometric models. It then introduces a range of spatial econometric models, particularly spatial lag, spatial error, and spatial lag of X models, illustrating how these models accommodate spatial relationships and yield accurate and insightful results about the underlying spatial processes. The chapter provides an intuitive understanding of these models compare to each other. A practical example on London house prices demonstrates the application of spatial econometrics, emphasising its relevance in uncovering hidden spatial patterns, addressing endogeneity, and providing robust estimates in the presence of spatial dependence.
+
+
+### Keywords {.unnumbered}
+
+Spatial Econometrics; Spatial Data Analysis; Spatial Dependence; Spatial Spillovers; London House Prices

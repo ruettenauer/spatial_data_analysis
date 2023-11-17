@@ -1,0 +1,403 @@
+
+# Prepare example data
+
+### Required packages {.unnumbered}
+
+```{r, message = FALSE, warning = FALSE, results = 'hide'}
+pkgs <- c("sf", "mapview", "nngeo",  "dplyr", "osmdata",
+          "nomisr", "tidyr", "texreg", "downlit", "xml2") 
+lapply(pkgs, require, character.only = TRUE)
+
+```
+
+
+## Importing some real world data
+
+`sf` imports many of the most common spatial data files, like geojson, gpkg, or shp.
+
+### London shapefile (polygon)
+
+Let's get some administrative boundaries for London from the [London Datastore](https://data.london.gov.uk/dataset/statistical-gis-boundary-files-london). We use the `sf` package and its funtion `st_read()` to import the data.
+
+```{r, cache=TRUE}
+# Create subdir (all data withh be stored in "_data")
+dn <- "_data"
+ifelse(dir.exists(dn), "Exists", dir.create(dn))
+
+# Download zip file and unzip
+tmpf <- tempfile()
+boundary.link <- "https://data.london.gov.uk/download/statistical-gis-boundary-files-london/9ba8c833-6370-4b11-abdc-314aa020d5e0/statistical-gis-boundaries-london.zip"
+download.file(boundary.link, tmpf)
+unzip(zipfile = tmpf, exdir = paste0(dn))
+unlink(tmpf)
+
+# This is a shapefile
+# We only need the MSOA layer for now
+msoa.spdf <- st_read(dsn = paste0(dn, "/statistical-gis-boundaries-london/ESRI"),
+                     layer = "MSOA_2011_London_gen_MHW" # Note: no file ending
+                     )
+
+```
+
+The object `msoa.spdf` is our spatial data.frame. It looks essentially like a conventional data.frame, but has some additional attributes and geo-graphical information stored with it. Most importantly, notice the column `geometry`, which contains a list of polygons. In most cases, we have one polygon for each line / observation.
+
+```{r, cache=FALSE}
+head(msoa.spdf)
+
+```
+
+
+
+### Census API (admin units)
+
+Now that we have some boundaries and shapes of spatial units in London, we can start looking for different data sources to populate the geometries.
+
+A good source for demographic data is for instance the 2011 census. Below we use the nomis API to retrieve population data for London, See the [Vignette](https://cran.r-project.org/web/packages/nomisr/vignettes/introduction.html) for more information (Guest users are limited to 25,000 rows per query). Below is a wrapper to avoid some errors with sex and urban-rural cross-tabulation in some of the data.
+
+```{r, cache=TRUE}
+### For larger request, register and set key
+# Sys.setenv(NOMIS_API_KEY = "XXX")
+# nomis_api_key(check_env = TRUE)
+
+x <- nomis_data_info()
+
+# Get London ids
+london_ids <- msoa.spdf$MSOA11CD
+
+### Get key statistics ids
+# select requires tables (https://www.nomisweb.co.uk/sources/census_2011_ks)
+# Let's get KS201EW (ethnic group), KS205EW (passport held), and KS402EW (housing tenure)
+
+# Get internal ids
+stats <- c("KS201EW", "KS402EW", "KS205EW")
+oo <- which(grepl(paste(stats, collapse = "|"), x$name.value))
+ksids <- x$id[oo]
+ksids # This are the internal ids
+
+
+### look at meta information
+q <- nomis_overview(ksids[1])
+head(q)
+a <- nomis_get_metadata(id = ksids[1], concept = "GEOGRAPHY", type = "type")
+a # TYPE297 is MSOA level
+
+b <- nomis_get_metadata(id = ksids[1], concept = "MEASURES", type = "TYPE297")
+b # 20100 is the measure of absolute numbers
+
+
+### Query data in loop over the required statistics
+for(i in ksids){
+
+  # Determin if data is divided by sex or urban-rural
+  nd <- nomis_get_metadata(id = i)
+  if("RURAL_URBAN" %in% nd$conceptref){
+    UR <- TRUE
+  }else{
+    UR <- FALSE
+  }
+  if("C_SEX" %in% nd$conceptref){
+    SEX <- TRUE
+  }else{
+    SEX <- FALSE
+  }
+
+  # make data request
+  if(UR == TRUE){
+    if(SEX == TRUE){
+      tmp_en <- nomis_get_data(id = i, time = "2011",
+                               geography = london_ids, # replace with "TYPE297" for all MSOAs
+                               measures = 20100, RURAL_URBAN = 0, C_SEX = 0)
+    }else{
+      tmp_en <- nomis_get_data(id = i, time = "2011",
+                               geography = london_ids, # replace with "TYPE297" for all MSOAs
+                               measures = 20100, RURAL_URBAN = 0)
+    }
+  }else{
+    if(SEX == TRUE){
+      tmp_en <- nomis_get_data(id = i, time = "2011",
+                               geography = london_ids, # replace with "TYPE297" for all MSOAs
+                               measures = 20100, C_SEX = 0)
+    }else{
+      tmp_en <- nomis_get_data(id = i, time = "2011",
+                               geography = london_ids, # replace with "TYPE297" for all MSOAs
+                               measures = 20100)
+    }
+
+  }
+
+  # Append (in case of different regions)
+  ks_tmp <- tmp_en
+
+  # Make lower case names
+  names(ks_tmp) <- tolower(names(ks_tmp))
+  names(ks_tmp)[names(ks_tmp) == "geography_code"] <- "msoa11"
+  names(ks_tmp)[names(ks_tmp) == "geography_name"] <- "name"
+
+  # replace weird cell codes
+  onlynum <- which(grepl("^[[:digit:]]+$", ks_tmp$cell_code))
+  if(length(onlynum) != 0){
+    code <- substr(ks_tmp$cell_code[-onlynum][1], 1, 7)
+    if(is.na(code)){
+      code <- i
+    }
+    ks_tmp$cell_code[onlynum] <- paste0(code, "_", ks_tmp$cell_code[onlynum])
+  }
+
+  # save codebook
+  ks_cb <- unique(ks_tmp[, c("date", "cell_type", "cell", "cell_code", "cell_name")])
+
+  ### Reshape
+  ks_res <- tidyr::pivot_wider(ks_tmp, id_cols = c("msoa11", "name"),
+                               names_from = "cell_code",
+                               values_from = "obs_value")
+
+  ### Merge
+  if(i == ksids[1]){
+    census_keystat.df <- ks_res
+    census_keystat_cb.df <- ks_cb
+  }else{
+    census_keystat.df <- merge(census_keystat.df, ks_res, by = c("msoa11", "name"), all = TRUE)
+    census_keystat_cb.df <- rbind(census_keystat_cb.df, ks_cb)
+  }
+
+}
+
+
+# Descriptions are saved in the codebook
+head(census_keystat_cb.df)
+save(census_keystat_cb.df, file = "_data/Census_codebook.RData")
+```
+
+
+Now, we have one file containing the geometries of MSOAs and one file with the census information on ethnic groups. Obviously, we can easily merge them together using the MSOA identifiers.
+
+```{r}
+msoa.spdf <- merge(msoa.spdf, census_keystat.df,
+                   by.x = "MSOA11CD", by.y = "msoa11", all.x = TRUE)
+```
+
+And we can, for instance, plot the spatial distribution of ethnic groups.
+
+```{r}
+# Define ethnic group shares
+msoa.spdf$per_white <- msoa.spdf$KS201EW_100 / msoa.spdf$KS201EW0001 * 100
+msoa.spdf$per_mixed <- msoa.spdf$KS201EW_200 / msoa.spdf$KS201EW0001 * 100
+msoa.spdf$per_asian <- msoa.spdf$KS201EW_300 / msoa.spdf$KS201EW0001 * 100
+msoa.spdf$per_black <- msoa.spdf$KS201EW_400 / msoa.spdf$KS201EW0001 * 100
+msoa.spdf$per_other <- msoa.spdf$KS201EW_500 / msoa.spdf$KS201EW0001 * 100
+
+# Define tenure
+msoa.spdf$per_owner <- msoa.spdf$KS402EW_100 / msoa.spdf$KS402EW0001 * 100
+msoa.spdf$per_social <- msoa.spdf$KS402EW_200 / msoa.spdf$KS402EW0001 * 100
+
+# Non British passport
+msoa.spdf$per_nonUK <- (msoa.spdf$KS205EW0001 - msoa.spdf$KS205EW0003)/ msoa.spdf$KS205EW0001 * 100
+msoa.spdf$per_nonEU <- (msoa.spdf$KS205EW0001 - msoa.spdf$KS205EW0003 -
+                          msoa.spdf$KS205EW0004 - msoa.spdf$KS205EW0005  - 
+                          msoa.spdf$KS205EW0006)/ msoa.spdf$KS205EW0001 * 100
+msoa.spdf$per_nonUK_EU <- (msoa.spdf$KS205EW0005  + msoa.spdf$KS205EW0006)/ msoa.spdf$KS205EW0001 * 100
+
+```
+
+### House prices
+
+For some examples later, we also add data on house prices. We use the median house prices in 2017 from the [London Datastore](https://data.london.gov.uk/dataset/average-house-prices).
+
+```{r house-prices, cache=TRUE}
+# Download
+hp.link <- "https://data.london.gov.uk/download/average-house-prices/bdf8eee7-41e1-4d24-90ce-93fe5cf040ae/land-registry-house-prices-MSOA.csv"
+hp.df <- read.csv(hp.link)
+
+hp.df <- hp.df[which(hp.df$Measure == "Median" &
+                       grepl("2011", hp.df$Year)), ]
+table(hp.df$Year)
+
+# Aggregate across 2011 values
+hp.df$med_house_price <- as.numeric(hp.df$Value)
+hp.df <- aggregate(hp.df[, "med_house_price", drop = FALSE],
+                   by = list(MSOA11CD = hp.df$Code),
+                   FUN = function(x) mean(x, na.rm = TRUE))
+
+# Merge spdf and housing prices
+msoa.spdf <- merge(msoa.spdf, hp.df,
+                   by = "MSOA11CD",
+                   all.x = TRUE, all.y = FALSE)
+hist(log(msoa.spdf$med_house_price))
+```
+
+
+
+### Tree cover (gridded)
+
+The London Tree Canopy Cover data provides data on tree coverage in London based on high-resolution imagery and machine learning techniques, again available at [London Datastore](https://data.london.gov.uk/dataset/curio-canopy).
+
+```{r}
+# Download zip shapefile
+tmpf <- tempfile()
+trees.link <- "https://data.london.gov.uk/download/curio-canopy/4fd54ef7-195f-43dc-a0d1-24e96e876f6c/shp-hexagon-files.zip"
+download.file(trees.link, tmpf)
+unzip(zipfile = tmpf, exdir = paste0(dn))
+unlink(tmpf)
+
+# Read
+trees.spdf <- st_read(dsn = paste0(dn, "/shp-hexagon-files"),
+                      layer = "gla-canopy-hex")
+
+# mapview(trees.spdf[, "canopy_per"])
+
+```
+
+
+We might also be interested in the average tree cover density within 2 km radius around each MSOA centroid. Therefore, we first create a buffer with `st_buffer()` around each midpoint and subsequently use `st_intersetion()` to calculate the overlap.
+
+Note: for buffer related methods, it often makes sense to use population weighted centroids instead of geographic centroids (see [here](https://geoportal.statistics.gov.uk/datasets/ons::msoa-dec-2011-population-weighted-centroids-in-england-and-wales/explore) for MSOA population weighted centroids).
+
+```{r}
+# # population weighted centroid
+# cent.sp <- st_read(dsn = "_data/MSOA_Dec_2011_PWC_in_England_and_Wales_2022_-4970423835205684272",
+#                    layer = "MSOA_Dec_2011_PWC_in_England_and_Wales")
+# 
+# cent.sp <- st_transform(cent.sp, st_crs(msoa.spdf)) 
+# cent.sp <- cent.sp[msoa.spdf, ]
+# 
+# # Create buffer (2km radius)
+# cent.buf <- st_buffer(cent.sp, dist = 2000)
+# 
+# # Calculate intersection between buffers and tree-cover hexagons
+# trees.spdf <- st_transform(trees.spdf, st_crs(msoa.spdf))
+# buf_hex.int <- st_intersection(cent.buf, trees.spdf)
+# dim(buf_hex.int)
+
+# USe actual LSOA boundaries here
+trees.spdf <- st_transform(trees.spdf, st_crs(msoa.spdf))
+msoa.spdf$msoa_area <- as.numeric(st_area(msoa.spdf))
+msoa_hex.int <- st_intersection(msoa.spdf, trees.spdf)
+
+# We could also calculate the area of overlap for each pair (to calculate weighted averages)
+msoa_hex.int$cover_area <- as.numeric(st_area(msoa_hex.int))
+msoa_hex.int$cover_per <- msoa_hex.int$cover_area / msoa_hex.int$msoa_area
+
+# Or we just use the simple average per each MSOA
+msoa_hex.int$canopy_per <- msoa_hex.int$canopy_per * msoa_hex.int$cover_per
+msoa_hex.int$canopykmsq <- msoa_hex.int$canopykmsq * msoa_hex.int$cover_per
+msoa_hex.int <- aggregate(list(tree_cover_per = msoa_hex.int$canopy_per,
+                              tree_cover_kmsq = msoa_hex.int$canopykmsq),
+                         by = list(MSOA11CD = msoa_hex.int$MSOA11CD),
+                         sum)
+
+# Merge back to spatial data.frame
+msoa.spdf <- merge(msoa.spdf, msoa_hex.int, by = "MSOA11CD", all.x = TRUE)
+
+hist(msoa.spdf$tree_cover_per)
+
+```
+
+### Parks via OSM
+
+
+```{r}
+# bounding box of where we want to query data
+q <- opq(bbox = st_bbox(st_transform(msoa.spdf, 4326)),  timeout = 120)
+
+# First build the query of location of parks in London
+osmq <- add_osm_feature(q, key = "leisure", value = c("park"))
+
+# And then query the data
+parks.osm <- osmdata_sf(osmq)
+
+# Make unique points / polygons
+parks.osm <- unique_osmdata(parks.osm)
+
+# Get points and polygons (there are barley any parks as polygons, so we ignore them)
+parks.spdf <- parks.osm$osm_polygons
+
+# Reduce to a few variables
+parks.spdf <- parks.spdf[, c("osm_id", "name")]
+
+park.spdf <- st_union(parks.spdf)
+
+# Calculate intersection between buffers and tree-cover hexagons
+park.spdf <- st_transform(park.spdf, st_crs(msoa.spdf)) 
+msoa_park.int <- st_intersection(msoa.spdf, park.spdf)
+
+# We could also calculate the area of overlap for each pair (to calculate weighted averages)
+msoa_park.int$park_kmsq <- as.numeric(st_area(msoa_park.int)) * 1e-6
+msoa_park.int <- st_drop_geometry(msoa_park.int[, c("MSOA11CD", "park_kmsq")])
+
+# Merge back to spatial data.frame
+msoa.spdf <- merge(msoa.spdf, msoa_park.int, by = "MSOA11CD", all.x = TRUE)
+msoa.spdf$park_kmsq[is.na(msoa.spdf$park_kmsq)] <- 0
+msoa.spdf$park_per <- (msoa.spdf$park_kmsq / 1e-6) / as.numeric(st_area(msoa.spdf)) * 100
+```
+
+
+
+### Public Transport
+
+Public transport access in the [London Datastore}(https://data.london.gov.uk/dataset/public-transport-accessibility-levels)
+
+```{r}
+# Download zip shapefile
+tmpf <- tempfile()
+publ.link <- "https://data.london.gov.uk/download/public-transport-accessibility-levels/77d9b319-931e-4090-bf8e-f578938bd352/LSOA2011%20AvPTAI2015.csv"
+download.file(publ.link, tmpf)
+
+# Read
+publ.df <- read.csv(tmpf)
+```
+
+Use census lookups to bring on MSOA level
+
+```{r}
+
+# Download zip
+tmpf <- tempfile()
+lookup.link <- "https://data.london.gov.uk/download/geographic-lookups-for-london/4435e90b-37ba-4fbc-a474-867422f39f83/2011%2520_OA-LSOA-MSOA-LA.csv"
+download.file(lookup.link, tmpf)
+lookup.df <- read.csv(tmpf)
+
+# reduce to lsoa-msoa
+lookup.df <- unique(lookup.df[, c("LSOA11CD", "MSOA11CD")])
+
+
+# aggregte publication transport values
+names(publ.df)[1] <- "LSOA11CD"
+publ.df <- merge(publ.df, lookup.df, by = "LSOA11CD")
+publ_msoa.df <- aggregate(list(pt_access_index = publ.df$AvPTAI2015,
+                               pt_access_index_hi = publ.df$PTAIHigh,
+                               pt_access_index_lo = publ.df$PTAILow),
+                          by = list(MSOA11CD = publ.df$MSOA11CD),
+                          mean)
+
+# Merge
+msoa.spdf <- merge(msoa.spdf, publ_msoa.df, by = "MSOA11CD")
+
+hist(msoa.spdf$pt_access_index)
+```
+
+
+```{r}
+### Distance to city center
+# Define centre
+centre <- st_as_sf(data.frame(lon = -0.128120855701165, 
+                              lat = 51.50725909644806),
+                   coords = c("lon", "lat"), 
+                   crs = 4326)
+# Reproject
+centre <- st_transform(centre, crs = st_crs(msoa.spdf))
+# Calculate distance
+msoa.spdf$dist_centre <- as.numeric(st_distance(msoa.spdf, centre)) / 1000
+hist(msoa.spdf$dist_centre)
+```
+
+
+### Save spatial data
+
+```{r}
+# Drop raw census vars
+oo <- which(!grepl("^KS", names(msoa.spdf)))
+msoa.spdf <- msoa.spdf[, oo]
+
+# Save
+save(msoa.spdf, file = "_data/msoa2_spatial.RData")
+```
